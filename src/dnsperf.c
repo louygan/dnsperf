@@ -65,6 +65,8 @@
 
 #define RECV_BATCH_SIZE 16
 
+#define LATENCY_THRESHOLD 10000 // 10 ms
+
 typedef struct {
     int                argc;
     char**             argv;
@@ -97,12 +99,18 @@ typedef struct {
 } times_t;
 
 typedef struct {
+    uint64_t timedout_timestamp;
+    uint64_t num_timedout;
+} estat_t;
+
+typedef struct {
     uint64_t rcodecounts[16];
 
     uint64_t num_sent;
     uint64_t num_interrupted;
     uint64_t num_timedout;
     uint64_t num_completed;
+    uint64_t num_latency_x;
 
     uint64_t total_request_size;
     uint64_t total_response_size;
@@ -119,7 +127,16 @@ typedef struct {
     uint64_t conn_latency_sum_squares;
     uint64_t conn_latency_min;
     uint64_t conn_latency_max;
+
+    uint64_t first_timedout_timestamp;
+    uint64_t first_error_resp_timestamp;
+    uint64_t last_timedout_timestamp;
+    uint64_t last_error_resp_timestamp;
+
+    estat_t timedout_timestamp_list[256];
+    estat_t error_resp_timestamp_list[256];
 } stats_t;
+
 
 typedef perf_list(struct query_info) query_list;
 
@@ -322,6 +339,11 @@ print_statistics(const config_t* config, const times_t* times, stats_t* stats)
                 / MILLION);
     }
 
+    printf("  Num of packets(latency < 10 ms): %" PRIu64 " (completed: (%.2lf%%), sent: (%.2lf%%))\n",
+		    stats->num_latency_x,
+		    PERF_SAFE_DIV(100.0 * stats->num_latency_x, stats->num_completed),
+		    PERF_SAFE_DIV(100.0 * stats->num_latency_x, stats->num_sent));
+
     printf("\n");
 
     if (!stats->num_conn_completed) {
@@ -363,6 +385,7 @@ sum_stats(const config_t* config, stats_t* total)
         total->num_interrupted += stats->num_interrupted;
         total->num_timedout += stats->num_timedout;
         total->num_completed += stats->num_completed;
+	total->num_latency_x += stats->num_latency_x;
 
         total->total_request_size += stats->total_request_size;
         total->total_response_size += stats->total_response_size;
@@ -991,6 +1014,9 @@ do_recv(void* arg)
                 stats->latency_min = latency;
             if (latency > stats->latency_max)
                 stats->latency_max = latency;
+	    /* if latency < 10 ms, step counter */
+	    if (latency < LATENCY_THRESHOLD)
+		stats->num_latency_x++;
         }
 
         if (nrecvd > 0)
@@ -1026,14 +1052,48 @@ do_interval_stats(void* arg)
     uint64_t               now;
     uint64_t               last_interval_time;
     uint64_t               last_completed;
+    uint64_t               last_timedout;
     uint64_t               interval_time;
     uint64_t               num_completed;
+    uint64_t               num_timedout;
     double                 qps;
     struct perf_net_socket sock = { .mode = sock_pipe, .fd = threadpipe[0] };
+    unsigned int           tsec;
+    unsigned int           tmsec;
+    unsigned int           last_times;
+
+    FILE                   *fw;
+    bool                   file_opened; 
 
     tinfo              = arg;
     last_interval_time = tinfo->times->start_time;
     last_completed     = 0;
+    last_timedout      = 0;
+    file_opened        = true;
+    last_times         = 1;
+
+    perf_log_printf("Interval stats starts with timeout: %lu and interval %lu",
+		    tinfo->config->timeout,tinfo->config->stats_interval);
+
+    if (tinfo->config->stats_interval < tinfo->config->timeout)
+    {
+        last_times = (tinfo->config->timeout/tinfo->config->stats_interval) + 1;
+    }
+
+    perf_log_printf("Interval stats will last %d time(s) print at the end", last_times);
+
+    if (!(fw = fopen("./perf_interval_stats.txt", "wt")))
+    {
+        perf_log_printf("Can not create perf_interval_stats.txt, directly printout instead");
+	file_opened = false;
+    }
+
+    if (file_opened)
+    {
+        fprintf(fw, "%s\n", "interval stats starts...");
+	fclose(fw);
+	fw = fopen("./perf_interval_stats.txt", "a"); //switch to append mode
+    }
 
     wait_for_start();
     while (perf_os_waituntilreadable(&sock, threadpipe[0],
@@ -1043,14 +1103,58 @@ do_interval_stats(void* arg)
         sum_stats(tinfo->config, &total);
         interval_time = now - last_interval_time;
         num_completed = total.num_completed - last_completed;
+	num_timedout = total.num_timedout - last_timedout;
         qps           = num_completed / (((double)interval_time) / MILLION);
-        perf_log_printf("%u.%06u: %.6lf",
-            (unsigned int)(now / MILLION),
-            (unsigned int)(now % MILLION), qps);
+	tsec          = (unsigned int)(now / MILLION);
+	tmsec         = (unsigned int)(now % MILLION);
+
+	if (file_opened)
+	{
+	    fprintf(fw, "[%u.%06u] qps:%.6lf timedout:%lu\n",
+			    tsec, tmsec, qps, num_timedout);
+	}
+	perf_log_printf("[%u.%06u] qps:%.6lf timedout:%lu",
+            tsec, tmsec, qps, num_timedout);
         last_interval_time = now;
         last_completed     = total.num_completed;
+	last_timedout      = total.num_timedout;
     }
 
+    /* This is the ending part
+     * The interval stats will last until the timeout of last sent pkg (if happens)
+     * */
+    for (int i=0; i<last_times; i++)
+    {
+	usleep(tinfo->config->timeout);
+        now = perf_get_time();
+        sum_stats(tinfo->config, &total);
+        interval_time = now - last_interval_time;
+        num_completed = total.num_completed - last_completed;
+        num_timedout = total.num_timedout - last_timedout;
+        qps           = num_completed / (((double)interval_time) / MILLION);
+        tsec          = (unsigned int)(now / MILLION);
+        tmsec         = (unsigned int)(now % MILLION);
+
+
+        if (file_opened)
+        {
+            /* fprintf(fw, "%s\n", "Delay 5s... will have one last final print"); */    
+	    fprintf(fw, "[%u.%06u] qps:%.6lf timedout:%lu\n",
+                            tsec, tmsec, qps, num_timedout);
+	}
+	perf_log_printf("[%u.%06u] qps:%.6lf timedout:%lu",
+			tsec, tmsec, qps, num_timedout);
+	last_interval_time = now;
+        last_completed     = total.num_completed;
+        last_timedout      = total.num_timedout;
+    }
+
+    if (file_opened)
+    {
+	fclose(fw);
+    }
+
+    perf_log_printf("perf_interval_stats.txt generated");
     return NULL;
 }
 
