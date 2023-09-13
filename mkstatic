@@ -1,0 +1,6 @@
+# make static linked dnsperf 
+#
+# run this sscript after make command.
+cd src
+gcc -I. -I.. -pthread    -g -O2 -D__x86_64__ -static   -o dnsperf datafile.o dns.o log.o net.o opt.o os.o strerror.o qtype.o edns.o tsig.o net_udp.o net_tcp.o net_dot.o dnsperf.o   -lssl -lcrypto -lldns -lm  -ldl -lpthread
+cp dnsperf ..
